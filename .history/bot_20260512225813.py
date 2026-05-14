@@ -1,0 +1,231 @@
+import os
+import asyncio
+from dotenv import load_dotenv
+import database
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+load_dotenv()
+
+waiting_users = set()
+waiting_jobs = {}
+waiting_edit = {}  # user_id -> row_id
+
+
+# ---------------- AUTO DELETE ----------------
+async def auto_delete(message, delay):
+    await asyncio.sleep(delay)
+    try:
+        await message.delete()
+    except Exception as e:
+        print("delete error:", e)
+
+
+# ---------------- TIMEOUT ----------------
+async def timeout_user(context: ContextTypes.DEFAULT_TYPE):
+
+    user_id = context.job.data["user_id"]
+    chat_id = context.job.data["chat_id"]
+
+    if user_id in waiting_users:
+        waiting_users.remove(user_id)
+
+        msg = await context.bot.send_message(
+            chat_id=chat_id, text="⏰ Time is finished. press Register again"
+        )
+
+        asyncio.create_task(auto_delete(msg, 8))
+
+
+# ---------------- BUILD LIST ----------------
+def build_players_text():
+
+    users = database.get_users()
+
+    if not users:
+        return "⚠️ No players registered yet.", InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📝 Register", callback_data="register")]]
+        )
+
+    text = "🏆 Registered Players:\n\n"
+    keyboard = []
+
+    for index,user in enumerate(users):
+        row_id = user[0]
+        username = user[2]
+
+        text += f"• {username}\n"
+
+        keyboard.append(
+            [
+                InlineKeyboardButton(f"✏️ {username}", callback_data=f"edit_{row_id}"),
+                InlineKeyboardButton("❌", callback_data=f"delete_{row_id}"),
+            ]
+        )
+
+    keyboard.append([InlineKeyboardButton("📝 Register", callback_data="register")])
+
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+# ---------------- START ----------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    keyboard = [
+        [InlineKeyboardButton("📝 Register / Add Name", callback_data="register")],
+        [InlineKeyboardButton("📋 Show List", callback_data="list")],
+    ]
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="🎮 Welcome!",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+# ---------------- BUTTON HANDLER ----------------
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    chat_id = query.message.chat.id
+
+    # ---------------- REGISTER ----------------
+    if query.data == "register":
+
+        waiting_users.add(user_id)
+
+        await context.bot.send_message(
+            chat_id=chat_id, text="✍️ Send name now... (1 min)"
+        )
+
+        job = context.job_queue.run_once(
+            timeout_user,
+            when=60,
+            data={
+                "user_id": user_id,
+                "chat_id": chat_id,
+            },
+        )
+
+        waiting_jobs[user_id] = job
+
+    # ---------------- LIST ----------------
+    elif query.data == "list":
+
+        text, markup = build_players_text()
+
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=query.message.message_id,
+            text=text,
+            reply_markup=markup,
+        )
+
+    # ---------------- DELETE ----------------
+    elif query.data.startswith("delete_"):
+
+        row_id = int(query.data.split("_")[1])
+
+        database.delete_name(row_id)
+
+        text, markup = build_players_text()
+
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=query.message.message_id,
+            text=text,
+            reply_markup=markup,
+        )
+
+    # ---------------- EDIT ----------------
+    elif query.data.startswith("edit_"):
+
+        row_id = int(query.data.split("_")[1])
+
+        waiting_edit[user_id] = row_id
+
+        await context.bot.send_message(chat_id=chat_id, text="✏️ Send new name...")
+
+
+# ---------------- MESSAGE HANDLER ----------------
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if not update.message:
+        return
+
+    user_id = update.message.from_user.id
+    text = update.message.text
+    chat_id = update.effective_chat.id
+
+    # ---------------- EDIT MODE ----------------
+    if user_id in waiting_edit:
+
+        row_id = waiting_edit[user_id]
+        del waiting_edit[user_id]
+
+        database.update_name(row_id, text)
+
+        msg = await context.bot.send_message(chat_id=chat_id, text="✅ Updated!")
+        asyncio.create_task(auto_delete(msg, 5))
+
+        text, markup = build_players_text()
+
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+
+        return
+
+    # ---------------- REGISTER MODE ----------------
+    if user_id in waiting_users:
+
+        if user_id in waiting_jobs:
+            waiting_jobs[user_id].schedule_removal()
+            del waiting_jobs[user_id]
+
+        database.add_user(user_id, text)
+        waiting_users.remove(user_id)
+
+        try:
+            await update.message.delete()
+        except:
+            pass
+
+        msg = await context.bot.send_message(chat_id=chat_id, text=f"✅ Saved: {text}")
+        asyncio.create_task(auto_delete(msg, 5))
+
+        text, markup = build_players_text()
+
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+
+    else:
+        if update.effective_chat.type == "private":
+            await context.bot.send_message(chat_id=chat_id, text="ℹ️ Press /start")
+
+
+# ---------------- MAIN ----------------
+def main():
+
+    database.create_table()
+
+    app = Application.builder().token(os.getenv("BOT_TOKEN")).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    print("🤖 Bot running...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
